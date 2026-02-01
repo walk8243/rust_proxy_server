@@ -49,11 +49,7 @@ async fn main() {
         target_url,
     };
 
-    let app = Router::new()
-        .route("/*path", any(proxy_handler))
-        .route("/", any(proxy_handler))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = create_app(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     tracing::info!("Listening on {}", addr);
@@ -61,6 +57,69 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn create_app(state: AppState) -> Router {
+    Router::new()
+        .route("/*path", any(proxy_handler))
+        .route("/", any(proxy_handler))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_proxy_forwards_request() {
+        // Start a mock server
+        let mock_server = MockServer::start().await;
+
+        // Configure mock server to respond to /get?foo=bar
+        Mock::given(method("GET"))
+            .and(path("/get"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "args": { "foo": "bar" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Setup proxy server
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target_url = mock_server.uri();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: target_url.clone(),
+        };
+
+        let app = create_app(state);
+
+        // Spawn proxy server in background
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        // Send request to proxy
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{}/get?foo=bar", port))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["args"]["foo"], "bar");
+    }
 }
 
 async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Response {
