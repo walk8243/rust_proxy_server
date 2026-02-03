@@ -8,8 +8,14 @@ use axum::{
 use clap::Parser;
 use reqwest::Client;
 use std::net::SocketAddr;
+
+use std::time::Duration;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use moka::future::Cache;
+use moka::Expiry;
+use axum::http::{StatusCode, HeaderMap};
+use axum::body::Bytes;
 
 #[derive(Parser, Clone)]
 struct Args {
@@ -26,6 +32,50 @@ struct Args {
 struct AppState {
     client: Client,
     target_url: String,
+    cache: Cache<String, CachedResponse>,
+}
+
+#[derive(Clone)]
+struct CachedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl IntoResponse for CachedResponse {
+    fn into_response(self) -> Response {
+        let mut builder = Response::builder().status(self.status);
+        *builder.headers_mut().unwrap() = self.headers;
+        builder.body(Body::from(self.body)).unwrap()
+    }
+}
+
+pub struct CacheExpiry;
+
+impl Expiry<String, CachedResponse> for CacheExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &CachedResponse,
+        _created_at: std::time::Instant,
+    ) -> Option<Duration> {
+        if let Some(cache_control) = value.headers.get("cache-control") {
+            if let Ok(cc_str) = cache_control.to_str() {
+                // Simple parsing for max-age=...
+                // Example: "public, max-age=60"
+                for part in cc_str.split(',') {
+                    let part = part.trim();
+                    if part.starts_with("max-age=") {
+                        if let Ok(seconds) = part.trim_start_matches("max-age=").parse::<u64>() {
+                            return Some(Duration::from_secs(seconds));
+                        }
+                    }
+                }
+            }
+        }
+        // Default to 1 hour if no max-age found
+        Some(Duration::from_secs(3600))
+    }
 }
 
 #[tokio::main]
@@ -44,9 +94,15 @@ async fn main() {
 
     let client = Client::new();
 
+    let cache = Cache::builder()
+        .max_capacity(10000)
+        .expire_after(CacheExpiry)
+        .build();
+
     let state = AppState {
         client,
         target_url,
+        cache,
     };
 
     let app = create_app(state);
@@ -97,6 +153,7 @@ mod tests {
         let state = AppState {
             client: Client::new(),
             target_url: target_url.clone(),
+            cache: Cache::builder().build(),
         };
 
         let app = create_app(state);
@@ -120,6 +177,151 @@ mod tests {
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["args"]["foo"], "bar");
     }
+
+    #[tokio::test]
+    async fn test_caching_behavior() {
+        let mock_server = MockServer::start().await;
+
+        // Verify that the server receives only one request for the cached path
+        Mock::given(method("GET"))
+            .and(path("/data")) // Expect stripped path
+            .respond_with(ResponseTemplate::new(200).set_body_string("cached_content"))
+            .expect(1) // Should be called only once
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/cache/data", port);
+
+        // First request
+        let resp1 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp1.status(), 200);
+        assert_eq!(resp1.text().await.unwrap(), "cached_content");
+
+        // Second request
+        let resp2 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp2.status(), 200);
+        assert_eq!(resp2.text().await.unwrap(), "cached_content");
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_ttl_behavior() {
+        let mock_server = MockServer::start().await;
+
+        // Response with short TTL (2 seconds)
+        Mock::given(method("GET"))
+            .and(path("/ttl")) // Expect stripped path
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "public, max-age=2")
+                .set_body_string("content_v1"))
+            .expect(1) // First fetch
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().expire_after(CacheExpiry).build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/cache/ttl", port);
+
+        // 1. Initial request (Miss -> Cache)
+        let resp1 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp1.text().await.unwrap(), "content_v1");
+
+        // 2. Immediate subsequent request (Hit)
+        let resp2 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp2.text().await.unwrap(), "content_v1");
+
+        // 3. Wait for expiration (2s + buffer)
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        // Reconfigure mock for new content
+        mock_server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/ttl")) // Expect stripped path
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "public, max-age=2")
+                .set_body_string("content_v2"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // 4. Request after expiration (Miss -> Fetch new content)
+        let resp3 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp3.text().await.unwrap(), "content_v2");
+    }
+
+    #[tokio::test]
+    async fn test_path_stripping() {
+        let mock_server = MockServer::start().await;
+
+        // Verify that the server receives request at /data (stripped)
+        Mock::given(method("GET"))
+            .and(path("/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("stripped_success"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        // Request to /cache/data should be forwarded to /data
+        let url = format!("http://127.0.0.1:{}/cache/data", port);
+        
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "stripped_success");
+    }
 }
 
 async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Response {
@@ -132,9 +334,32 @@ async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Respo
 
     let uri = format!("{}{}", state.target_url, path_query);
 
-    tracing::debug!("Proxying request to: {}", uri);
+    tracing::debug!("Incoming request for: {}", uri);
 
-    *req.uri_mut() = uri.parse().unwrap();
+    // Check for cache
+    let should_cache = path.starts_with("/cache");
+    let cache_key = if should_cache {
+        Some(format!("{} {}", req.method(), uri))
+    } else {
+        None
+    };
+
+    if let Some(key) = &cache_key {
+        if let Some(cached) = state.cache.get(key).await {
+            tracing::info!("Cache hit for {}", uri);
+            return cached.into_response();
+        }
+    }
+
+    let upstream_path_query = if should_cache {
+        path_query.strip_prefix("/cache").unwrap_or(path_query)
+    } else {
+        path_query
+    };
+
+    let uri = format!("{}{}", state.target_url, upstream_path_query);
+
+    tracing::debug!("Forwarding to upstream: {}", uri);
     
     // We need to remove the host header so reqwest calculates the correct one for the target
     req.headers_mut().remove(axum::http::header::HOST);
@@ -149,12 +374,33 @@ async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Respo
 
     match res {
         Ok(res) => {
-            let mut response_builder = Response::builder().status(res.status());
-            *response_builder.headers_mut().unwrap() = res.headers().clone();
-            response_builder
-                .body(Body::from_stream(res.bytes_stream()))
-                .unwrap()
-                .into_response()
+            if let Some(key) = cache_key {
+                let status = res.status();
+                let headers = res.headers().clone();
+                let body_bytes = res.bytes().await.unwrap_or_default(); // Read full body
+
+                let cached = CachedResponse {
+                    status,
+                    headers: headers.clone(),
+                    body: body_bytes.clone(),
+                };
+                
+                state.cache.insert(key, cached).await;
+
+                let mut response_builder = Response::builder().status(status);
+                *response_builder.headers_mut().unwrap() = headers;
+                response_builder
+                    .body(Body::from(body_bytes))
+                    .unwrap()
+                    .into_response()
+            } else {
+                let mut response_builder = Response::builder().status(res.status());
+                *response_builder.headers_mut().unwrap() = res.headers().clone();
+                response_builder
+                    .body(Body::from_stream(res.bytes_stream()))
+                    .unwrap()
+                    .into_response()
+            }
         }
         Err(err) => {
             tracing::error!("Proxy error: {}", err);
