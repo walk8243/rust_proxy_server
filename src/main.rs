@@ -16,6 +16,7 @@ use moka::future::Cache;
 use moka::Expiry;
 use axum::http::{StatusCode, HeaderMap};
 use axum::body::Bytes;
+use headers::HeaderMapExt;
 
 #[derive(Parser, Clone)]
 struct Args {
@@ -59,18 +60,9 @@ impl Expiry<String, CachedResponse> for CacheExpiry {
         value: &CachedResponse,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
-        if let Some(cache_control) = value.headers.get("cache-control") {
-            if let Ok(cc_str) = cache_control.to_str() {
-                // Simple parsing for max-age=...
-                // Example: "public, max-age=60"
-                for part in cc_str.split(',') {
-                    let part = part.trim();
-                    if part.starts_with("max-age=") {
-                        if let Ok(seconds) = part.trim_start_matches("max-age=").parse::<u64>() {
-                            return Some(Duration::from_secs(seconds));
-                        }
-                    }
-                }
+        if let Some(cache_control) = value.headers.typed_get::<headers::CacheControl>() {
+            if let Some(max_age) = cache_control.max_age() {
+                 return Some(max_age);
             }
         }
         // Default to 1 hour if no max-age found
@@ -176,6 +168,7 @@ mod tests {
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["args"]["foo"], "bar");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -220,6 +213,7 @@ mod tests {
         let resp2 = client.get(&url).send().await.unwrap();
         assert_eq!(resp2.status(), 200);
         assert_eq!(resp2.text().await.unwrap(), "cached_content");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -267,6 +261,9 @@ mod tests {
 
         // 3. Wait for expiration (2s + buffer)
         tokio::time::sleep(Duration::from_millis(2500)).await;
+        
+        // Should have received exactly 1 request so far (the initial fetch)
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
 
         // Reconfigure mock for new content
         mock_server.reset().await;
@@ -282,6 +279,9 @@ mod tests {
         // 4. Request after expiration (Miss -> Fetch new content)
         let resp3 = client.get(&url).send().await.unwrap();
         assert_eq!(resp3.text().await.unwrap(), "content_v2");
+        
+        // Should have received 1 *new* request after reset
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -321,6 +321,55 @@ mod tests {
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.text().await.unwrap(), "stripped_success");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_max_age_zero_behavior() {
+        let mock_server = MockServer::start().await;
+
+        // Response with max-age=0
+        Mock::given(method("GET"))
+            .and(path("/no-cache"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=0")
+                .set_body_string("content_zero"))
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().expire_after(CacheExpiry).build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/cache/no-cache", port);
+
+        // 1. First request
+        let resp1 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp1.status(), 200);
+        assert_eq!(resp1.text().await.unwrap(), "content_zero");
+
+        // 2. Second request
+        let resp2 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp2.status(), 200);
+        assert_eq!(resp2.text().await.unwrap(), "content_zero");
+        
+        // Should have received 2 requests
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
     }
 }
 
