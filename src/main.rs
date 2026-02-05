@@ -41,6 +41,7 @@ struct CachedResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+    created_at: std::time::Instant,
 }
 
 impl IntoResponse for CachedResponse {
@@ -60,13 +61,29 @@ impl Expiry<String, CachedResponse> for CacheExpiry {
         value: &CachedResponse,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
-        if let Some(cache_control) = value.headers.typed_get::<headers::CacheControl>() {
-            if let Some(max_age) = cache_control.max_age() {
-                 return Some(max_age);
-            }
-        }
-        // Default to 1 hour if no max-age found
-        Some(Duration::from_secs(3600))
+        let cache_control = value.headers.typed_get::<headers::CacheControl>();
+        
+        let max_age = cache_control
+            .as_ref()
+            .and_then(|cc| cc.max_age())
+            .unwrap_or(Duration::from_secs(3600));
+
+        let swr = value.headers.get("cache-control")
+            .and_then(|val| val.to_str().ok())
+            .and_then(|s| {
+                s.split(',')
+                    .find_map(|part| {
+                        let part = part.trim();
+                        if let Some(rest) = part.strip_prefix("stale-while-revalidate=") {
+                            rest.parse::<u64>().ok().map(Duration::from_secs)
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .unwrap_or(Duration::from_secs(0));
+
+        Some(max_age + swr)
     }
 }
 
@@ -449,6 +466,130 @@ mod tests {
         let no_cache_reqs = reqs.iter().filter(|r| r.url.path() == "/no-cache-header").count();
         assert_eq!(no_cache_reqs, 2, "No-cache should not be cached");
     }
+
+    #[tokio::test]
+    async fn test_swr_behavior() {
+        let mock_server = MockServer::start().await;
+
+        // Response with max-age=1, stale-while-revalidate=2
+        Mock::given(method("GET"))
+            .and(path("/swr-test"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=1, stale-while-revalidate=2")
+                .set_body_string("content_v1"))
+            .expect(1) // Initial fetch only (background fetch is async/detached, might complete later or be mocked separately)
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().expire_after(CacheExpiry).build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/swr/swr-test", port);
+
+        // 1. Initial request (Miss -> Cache)
+        let resp1 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp1.text().await.unwrap(), "content_v1");
+
+        // 2. Wait for expiration (1.2s > max-age but < max-age+swr)
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Prepare mock for second response (background fetch)
+        mock_server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/swr-test"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=1, stale-while-revalidate=2")
+                .set_body_string("content_v2"))
+            .expect(1) // Expect background fetch
+            .mount(&mock_server)
+            .await;
+
+        // 3. Request (Stale Hit)
+        let resp2 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp2.text().await.unwrap(), "content_v1"); // Should be stale content
+
+        // Wait for background task to complete (give it some time)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        
+        // 4. Request (Fresh Hit from background update)
+        let resp3 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp3.text().await.unwrap(), "content_v2");
+    }
+
+    #[tokio::test]
+    async fn test_swr_disabled_for_cache_path() {
+         let mock_server = MockServer::start().await;
+
+        // Response with max-age=1, stale-while-revalidate=2
+        Mock::given(method("GET"))
+            .and(path("/swr-disabled"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=1, stale-while-revalidate=2")
+                .set_body_string("content_v1"))
+            .expect(1) 
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().expire_after(CacheExpiry).build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        // Use /cache prefix, so SWR should be disabled
+        let url = format!("http://127.0.0.1:{}/cache/swr-disabled", port);
+
+        // 1. Initial request (Miss -> Cache)
+        let resp1 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp1.text().await.unwrap(), "content_v1");
+
+        // 2. Wait for max-age expiration (1.2s)
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Update mock
+        mock_server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/swr-disabled"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "max-age=1, stale-while-revalidate=2")
+                .set_body_string("content_v2"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // 3. Request - Should ignore stale cache and fetch fresh immediately because SWR is disabled for /cache
+        let resp2 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp2.text().await.unwrap(), "content_v2");
+    }
 }
 
 async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Response {
@@ -464,7 +605,9 @@ async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Respo
     tracing::debug!("Incoming request for: {}", uri);
 
     // Check for cache
-    let should_cache = path.starts_with("/cache");
+    let should_use_swr = path.starts_with("/swr");
+    let should_cache = path.starts_with("/cache") || should_use_swr;
+
     let cache_key = if should_cache {
         Some(format!("{} {}", req.method(), uri))
     } else {
@@ -473,13 +616,98 @@ async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Respo
 
     if let Some(key) = &cache_key {
         if let Some(cached) = state.cache.get(key).await {
-            tracing::info!("Cache hit for {}", uri);
-            return cached.into_response();
+            let now = std::time::Instant::now();
+            let age = now.duration_since(cached.created_at);
+
+            // Calculate freshness lifetime
+            let cache_control = cached.headers.typed_get::<headers::CacheControl>();
+            let max_age = cache_control
+                .as_ref()
+                .and_then(|cc| cc.max_age())
+                .unwrap_or(Duration::from_secs(3600));
+
+            let swr = cached.headers.get("cache-control")
+                .and_then(|val| val.to_str().ok())
+                .and_then(|s| {
+                    s.split(',')
+                        .find_map(|part| {
+                            let part = part.trim();
+                            if let Some(rest) = part.strip_prefix("stale-while-revalidate=") {
+                                rest.parse::<u64>().ok().map(Duration::from_secs)
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .unwrap_or(Duration::from_secs(0));
+
+            if age < max_age {
+                 tracing::info!("Cache hit (fresh) for {}", uri);
+                 return cached.into_response();
+            } else if age < max_age + swr && should_use_swr {
+                 tracing::info!("Cache hit (stale) for {} - revalidating in background", uri);
+                 
+                 // Spawn background revalidation
+                 let state = state.clone();
+                 let key = key.clone();
+                 let method = req.method().clone();
+                 let headers = req.headers().clone();
+                 // Reconstruct upstream URI for background request
+                 // Use the original logic for upstream path
+                 let upstream_path_query = path_query.strip_prefix("/swr").unwrap_or(path_query);
+                 let bg_uri = format!("{}{}", state.target_url, upstream_path_query);
+
+                 tokio::spawn(async move {
+                    let client = state.client;
+                    // Remove host header as per original logic
+                    let mut headers = headers;
+                    headers.remove(axum::http::header::HOST);
+
+                    let res = client.request(method, &bg_uri)
+                        .headers(headers)
+                        .send()
+                        .await;
+
+                    if let Ok(res) = res {
+                         let status = res.status();
+                         let headers = res.headers().clone();
+                         if let Ok(body_bytes) = res.bytes().await {
+                            // Check Cache-Control headers
+                            let should_store = if let Some(cache_control) = headers.typed_get::<headers::CacheControl>() {
+                                !cache_control.private() && !cache_control.no_store() && !cache_control.no_cache()
+                            } else {
+                                true
+                            };
+
+                            if should_store {
+                                let cached = CachedResponse {
+                                    status,
+                                    headers,
+                                    body: body_bytes,
+                                    created_at: std::time::Instant::now(),
+                                };
+                                state.cache.insert(key, cached).await;
+                            }
+                         }
+                    }
+                 });
+
+                 return cached.into_response();
+            }
+             
+             // If we are here:
+             // 1. It's stale but strictly expired (age > max_age + swr) -> Treat as miss (though moka might have evicted it, race condition possible)
+             // 2. It's stale (age > max_age) but we are NOT in /swr path -> Treat as miss (ignore cache)
+             tracing::info!("Cache item invalid/ignored for {}", uri);
         }
     }
 
     let upstream_path_query = if should_cache {
-        path_query.strip_prefix("/cache").unwrap_or(path_query)
+        if should_use_swr {
+             path_query.strip_prefix("/swr").unwrap_or(path_query)
+        } else {
+             path_query.strip_prefix("/cache").unwrap_or(path_query)
+        }
     } else {
         path_query
     };
@@ -518,6 +746,7 @@ async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Respo
                         status,
                         headers: headers.clone(),
                         body: body_bytes.clone(),
+                        created_at: std::time::Instant::now(),
                     };
                     
                     state.cache.insert(key, cached).await;
