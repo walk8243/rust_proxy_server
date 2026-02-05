@@ -371,6 +371,84 @@ mod tests {
         // Should have received 2 requests
         assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
     }
+
+    #[tokio::test]
+    async fn test_cache_control_headers() {
+        let mock_server = MockServer::start().await;
+
+        // 1. Private response
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "private")
+                .set_body_string("private_content"))
+            .mount(&mock_server)
+            .await;
+
+        // 2. No-store response
+        Mock::given(method("GET"))
+            .and(path("/no-store"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "no-store")
+                .set_body_string("no_store_content"))
+            .mount(&mock_server)
+            .await;
+
+        // 3. No-cache response
+        Mock::given(method("GET"))
+            .and(path("/no-cache-header"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "no-cache")
+                .set_body_string("no_cache_content"))
+            .mount(&mock_server)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        
+        let state = AppState {
+            client: Client::new(),
+            target_url: mock_server.uri(),
+            cache: Cache::builder().build(),
+        };
+
+        let app = create_app(state);
+        
+        tokio::spawn(async move {
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let base_url = format!("http://127.0.0.1:{}", port);
+
+        // Test Private
+        let url = format!("{}/cache/private", base_url);
+        client.get(&url).send().await.unwrap();
+        client.get(&url).send().await.unwrap();
+        // Should be 2 requests because it wasn't cached
+        let reqs = mock_server.received_requests().await.unwrap();
+        let private_reqs = reqs.iter().filter(|r| r.url.path() == "/private").count();
+        assert_eq!(private_reqs, 2, "Private should not be cached");
+
+        // Test No-Store
+        let url = format!("{}/cache/no-store", base_url);
+        client.get(&url).send().await.unwrap();
+        client.get(&url).send().await.unwrap();
+        let reqs = mock_server.received_requests().await.unwrap();
+        let no_store_reqs = reqs.iter().filter(|r| r.url.path() == "/no-store").count();
+        assert_eq!(no_store_reqs, 2, "No-store should not be cached");
+
+        // Test No-Cache
+        let url = format!("{}/cache/no-cache-header", base_url);
+        client.get(&url).send().await.unwrap();
+        client.get(&url).send().await.unwrap();
+        let reqs = mock_server.received_requests().await.unwrap();
+        let no_cache_reqs = reqs.iter().filter(|r| r.url.path() == "/no-cache-header").count();
+        assert_eq!(no_cache_reqs, 2, "No-cache should not be cached");
+    }
 }
 
 async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Response {
@@ -428,13 +506,22 @@ async fn proxy_handler(State(state): State<AppState>, mut req: Request) -> Respo
                 let headers = res.headers().clone();
                 let body_bytes = res.bytes().await.unwrap_or_default(); // Read full body
 
-                let cached = CachedResponse {
-                    status,
-                    headers: headers.clone(),
-                    body: body_bytes.clone(),
+                // Check Cache-Control headers
+                let should_store = if let Some(cache_control) = headers.typed_get::<headers::CacheControl>() {
+                    !cache_control.private() && !cache_control.no_store() && !cache_control.no_cache()
+                } else {
+                    true
                 };
-                
-                state.cache.insert(key, cached).await;
+
+                if should_store {
+                    let cached = CachedResponse {
+                        status,
+                        headers: headers.clone(),
+                        body: body_bytes.clone(),
+                    };
+                    
+                    state.cache.insert(key, cached).await;
+                }
 
                 let mut response_builder = Response::builder().status(status);
                 *response_builder.headers_mut().unwrap() = headers;
